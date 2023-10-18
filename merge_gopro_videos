@@ -1,0 +1,115 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'optparse'
+require 'tempfile'
+
+banner = <<~BANNER
+  This util tries to merge videos that have been split in multiple parts.
+  This often happens on GoPros and DJI cameras where recordings are split in 4gb parts.
+  Script takes multiple files (by default whole folder) and tries to create groups of
+  files that should be merged together in a single video.
+  By default it groups files if the filename is the same untile the second '_' (underscore) in filename.
+BANNER
+
+options = {
+  'global-matcher': '.*.mp4',
+  'grouping-matcher': '.*_.*_',
+  'dir': '.'
+}
+
+OptionParser.new do |op|
+  op.banner = banner
+  op.on('-m REGEX_MATCHER',
+        '--global-matcher REGEX_MATCHER',
+        "regex string matcher which files to consider (defaults to #{options[:'global-matcher']})")
+  op.on('-g REGEX_MATCHER', '--grouping-matcher REGEX_MATCHER',
+        <<~GM
+          Regex by which videos are grouped together.
+          Actual string that is matched by given matcher should be same for
+          all videos that should be merged together. Defaults to #{options[:'global-matcher']}.
+          The default value will group files like DJI_1234_001.mp4, DJI_1234_002.mp4 together
+        GM
+  )
+  op.on('-d DIR', '--dir DIR', 'Directory with videos to merge (defaults to current dir)')
+  op.on('-o OUTPUT_DIR', '--output-dir OUTPUT_DIR', 'Where output (merged) videos are saved (defaults to input dir)')
+  op.on('-h', '--help', 'Prints this help') do
+    puts op
+    exit
+  end
+end.parse!(into: options)
+
+# Finds the files, groups them and invokes ffmpeg to merge each group
+class VideoPartMerger
+  attr_reader :dir, :output_dir, :global_matcher, :grouping_matcher
+
+  def initialize(options)
+    @global_matcher = Regexp.new(options[:'global-matcher'], Regexp::IGNORECASE)
+    @grouping_matcher = Regexp.new(options[:'grouping-matcher'])
+    # Remove trailing slash (/) from path input
+    @dir = options[:dir].chomp('/')
+    @output_dir = (options[:'output-dir'] || @dir).chomp('/')
+  end
+
+  def perform
+    all_files =
+      Dir.entries(dir)
+         .select { |f| File.file?("#{dir}/#{f}") && f.match?(global_matcher) }
+
+    groups = {}
+    all_files.each do |file|
+      # Take characters of the string that are the same for all videos that should be merged together
+      group_base_name = file.scan(grouping_matcher)
+      next if group_base_name.empty?
+
+      group_base_name = group_base_name.first.chop
+      groups[group_base_name] ||= []
+      groups[group_base_name] << file
+    end
+
+    groups.each do |base_name, file_list|
+      groups[base_name].sort!
+      # Remove groups that have only one file
+      groups.delete(base_name) if file_list.size < 2
+    end
+
+    if groups.empty?
+      puts 'No video parts found, please see --help'
+      exit
+    end
+
+    groups.each_with_index do |(base_name, files), i|
+      puts "Merging following videos: (#{i + 1}/#{groups.size})"
+      files.each do |f|
+        puts "  #{f}"
+      end
+      puts "Output file: #{output_file_name(base_name)}"
+    end
+
+    puts 'Continue? (y/n)'
+    return unless gets.chomp == 'y'
+
+    groups.each do |base_name, files|
+      file = create_tempfile(base_name, files)
+      file.close
+
+      puts `ffmpeg -f concat -i #{file.path} -c copy #{output_file_name(base_name)}`
+    end
+  end
+
+  # Create file for every group of videos that need to be merged. This file is passed to ffmpeg
+  def create_tempfile(base_name, file_list)
+    tmp = Tempfile.open("#{base_name}_list", dir)
+    file_list.each do |f|
+      tmp.write("file #{f}\n")
+    end
+
+    tmp
+  end
+
+  def output_file_name(base_name)
+    "#{dir}/#{base_name}.mp4"
+  end
+end
+
+VideoPartMerger.new(options).perform
